@@ -17,6 +17,10 @@ on:
         description: "Package name"
         required: true
 
+permissions:
+    contents: write
+    packages: write
+
 jobs:
   validation:
     runs-on: ubuntu-latest
