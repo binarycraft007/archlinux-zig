@@ -1,0 +1,49 @@
+# This is a basic workflow to help you get started with Actions
+
+name: CI
+
+# Controls when the workflow will run
+on:
+  # Triggers the workflow on push or pull request events but only for the "main" branch
+  #push:
+  #  branches: [ "main" ]
+  #pull_request:
+  #  branches: [ "main" ]
+
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+    inputs:
+      package:
+        description: "Package name"
+        required: true
+
+jobs:
+  validation:
+    runs-on: ubuntu-latest
+    name: Validate a Pull Request
+    steps:
+      - uses: actions/checkout@v1
+
+      - name: Validate SRCINFO
+        id: validate-srcinfo
+        uses: ./.github/actions/pkgbuild
+        with:
+          target: 'srcinfo'
+          pkgname: "${{ github.event.inputs.package }}"
+
+      - name: Validate PKGBUILD
+        id: validate-pkgbuild
+        uses: ./.github/actions/pkgbuild
+        with:
+          target: 'pkgbuild'
+          pkgname: "${{ github.event.inputs.package }}"
+
+      - name: Prepare tools
+        run: |
+          wget -O ghr.tar.gz https://github.com/tcnksm/ghr/releases/download/v0.13.0/ghr_v0.13.0_linux_amd64.tar.gz
+          tar -xvf ghr.tar.gz
+          mv ghr*linux_amd64/ghr .
+
+      - name: Release packages 
+        run: |
+          ./ghr -t "${{ github.token }}" -n "${{ github.event.release.tag_name }}" "${{ github.event.release.tag_name }}" artifacts
