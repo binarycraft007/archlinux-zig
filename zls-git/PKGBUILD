@@ -9,24 +9,134 @@ provides=('zls')
 conflicts=('zls')
 replaces=('zls-master-data-git')
 license=('MIT')
-depends=('zig-dev-bin')
-makedepends=('git')
+makedepends=('git' 'curl' 'jq' 'minisign' 'ripgrep')
 source=(git+https://github.com/zigtools/${_pkgbasename})
 sha256sums=('SKIP')
             
+# https://ziglang.org/download/
+ZIG_MINISIGN_KEY="RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U";
+
 pkgver() {
-	cd "${srcdir}/${_pkgbasename}"
-	printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+    cd "${srcdir}/${_pkgbasename}"
+    printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+# Prints a warning message to stderr
+warning() {
+    echo -en "\e[33;1mWARNING\e[0m: " >&2;
+    echo "$@" >&2;
+}
+error() {
+    echo -en "\e[31;1mERROR\e[0m: " >&2;
+    echo "$@" >&2;
+}
+
+# Fetch the version index, deleting any cached version.
+refresh_version_index() {
+    FORCE_REFRESH=1 fetch_version_index
+}
+# NOTE: If we put version-index in `source` then it would be cached
+#
+# Instead, fetch it by hand.
+fetch_version_index() {
+    local index_file="${srcdir}/zig-version-index.json";
+    if [[ -f "$index_file" ]]; then
+        if [[ $FORCE_REFRESH -eq 1 ]]; then
+            # When ordered to 'refresh', we invalidate old verison-index.json
+            echo "Deleting existing version index file (refreshing)" >&2;
+            rm "$index_file";
+        else
+            echo $index_file;
+            return 0;
+        fi
+    fi
+    # Fallthrough to download index file
+    echo "Downloading version index..." >&2;
+    if ! curl -sS "https://ziglang.org/download/index.json" -o "$index_file"; then
+        error "Failed to download version index";
+        exit 1;
+    else
+        echo "Successfully downloaded version index (date: $(jq -r .master.date $index_file))" >&2;
+    fi
+    echo "$index_file"
+}
+
+# The original version of the zig package, without any sanitation
+original_pkgver() {
+    local index_file="$(fetch_version_index)"
+    jq -r '.master.version' "$index_file";
+}
+
+# Sanitizes the package version, replacing special characters
+#
+# Specifically, we replace '-' with '_' because it's special-cased by makepkg & pacman,
+# and replace '+$commit" with '.g$commit' because '+' is special-cased in URLs.
+# Also the second form '.g$commit" is more consistent with the VCS package guidelines
+# https://wiki.archlinux.org/title/VCS_package_guidelines#The_pkgver()_function
+#
+# Unlike VCS packages, there aren't really any clear guidelines on versioning
+# for auto-updating binaries,
+# so the versioning format of the package has changed somewhat over time.
+zigver() {
+    (
+        set -o pipefail;
+        # Sanitize `-` to `_`, `+` to `.g`
+        #
+        # So `0.12.0-dev.3429+13a9d94a8` becomes `0.12.0-dev.3429.g13a9d94a8`
+        #
+        # See VCS package guidelines for details:
+        original_pkgver | rg -e '^([\w\.]+)-(dev[\w\.]+)\+(\w+)$' -r '${1}_${2}.g${3}' || {
+            error "Version doesn't match pattern: '$(original_pkgver)'";
+            exit 1;
+        }
+    )
+}
+
+prepare() {
+    local index_file="$(refresh_version_index)";
+    local newver="$(zigver)";
+    pushd "${srcdir}" > /dev/null;
+    local newurl="$(jq -r ".master.\"${CARCH}-linux\".tarball" $index_file)";
+    local newurl_sig="$newurl.minisig";
+    local newfile="zig-linux-${CARCH}-${newver}.tar.xz";
+    local newfile_sig="$newfile.minisig";
+    # NOTE: The Arch Build System unfortunately doesn't handle dynamically added sources.
+    # source+=("${newfile}:${newurl}" "${newfile_sig}:${newurl_sig}")
+    local expected_hash="$(jq -r ".master.\"${CARCH}-linux\".shasum" "$index_file")"
+    # sha256sums+=("$expected_hash" "SKIP")
+    if [[ -f "$newfile" && -f "$newfile_sig" ]]; then
+        echo "Reusing existing $newfile (and signature)";
+    else
+        echo "Downloading Zig $newver from $newurl";
+        curl -Ss "$newurl" -o "$newfile";
+        echo "Downloading signature...";
+        curl -Ss "$newurl_sig" -o "$newfile_sig";
+    fi;
+    echo "" >&2;
+    local actual_hash="$(sha256sum "$newfile" | grep -oE '^\w+')"
+    if [[ "$expected_hash" != "$actual_hash" ]]; then
+        error "Expected hash $expected_hash for $newfile, but got $actual_hash" >&2;
+        exit 1;
+    fi;
+    echo "Using minisign to check signature";
+    if ! minisign -V -P "$ZIG_MINISIGN_KEY" -m "$newfile" -x "$newfile_sig"; then
+        error "Failed to check signature for $newfile" >&2;
+        exit 1;
+    fi
+    echo "Extracting file";
+    tar -xf "$newfile";
+    popd > /dev/null;
 }
 
 build() {
-	cd "${srcdir}/${_pkgbasename}"
-	zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe
+    export PATH=$PATH:"${srcdir}/zig-linux-${CARCH}-$(original_pkgver)/"
+    cd "${srcdir}/${_pkgbasename}"
+    zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe
 }
 
 package() {
-	cd "${srcdir}/${_pkgbasename}"
-
-	install -D -m755 zig-out/bin/$_pkgbasename "${pkgdir}/usr/bin/$_pkgbasename"
-	install -D -m644 LICENSE "${pkgdir}/usr/share/licenses/$_pkgbasename/LICENSE"
+    cd "${srcdir}/${_pkgbasename}"
+    
+    install -D -m755 zig-out/bin/$_pkgbasename "${pkgdir}/usr/bin/$_pkgbasename"
+    install -D -m644 LICENSE "${pkgdir}/usr/share/licenses/$_pkgbasename/LICENSE"
 }
